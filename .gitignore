@@ -1,0 +1,18 @@
+# Build outputs
+target/
+_target/
+build/
+*.o
+*.a
+*.elf
+*.bin
+
+# Wasmtime AOT artifacts (regenerated)
+*.cwasm
+
+# Record-replay trace (generated at runtime)
+tuner.trace
+*.trace
+
+# OS cruft
+.DS_Store

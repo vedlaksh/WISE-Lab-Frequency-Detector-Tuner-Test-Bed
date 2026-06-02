@@ -1,0 +1,44 @@
+[package]
+name = "adc_embed_nostd"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "adc_embed_nostd"
+crate-type = ["staticlib"] 
+
+# [build]
+# target = "riscv32imac-unknown-none-elf"
+
+# [target.riscv32imac-unknown-none-elf]
+# rustflags = [
+#   "-C", "link-arg=-T/home/jerryfen/zephyrproject/zephyr/apps/wasmtime-rr-prototyping/pulley_exp_wasmtime_nostd/link.ld",
+#   "-C", "link-arg=-W1,-Map=/home/jerryfen/zephyrproject/zephyr/apps/wasmtime-rr-prototyping/link.map",
+# ]
+
+[features]
+default = ["rr"]
+alloc = []
+rr = [
+  "wasmtime/rr"
+]
+
+# [dependencies]
+# spin = "0.10.0"
+# talc = { version = "4.4.3", default-features = false, features = ["lock_api", "counters"] }
+# itoa = { version = "1", default-features = false }
+
+[dependencies.wasmtime]
+path = "../crates/wasmtime"
+default-features = false
+features = [
+    "runtime",
+    "component-model",
+    "pulley",
+    # "cranelift",
+    # "gc-null",
+]
+
+
+[profile.release]
+panic = "abort"

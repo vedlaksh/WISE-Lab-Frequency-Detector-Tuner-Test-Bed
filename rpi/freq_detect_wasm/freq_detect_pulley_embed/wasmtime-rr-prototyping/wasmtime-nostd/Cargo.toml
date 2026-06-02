@@ -1,0 +1,37 @@
+# [package]
+#name = "wasmtime-nostd"
+#version.workspace = true
+#authors.workspace = true
+#edition.workspace = true
+#rust-version.workspace = true
+
+#[dependencies]
+
+#[lints]
+#workspace = true
+
+[package]
+name = "wasmtime-nostd"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+alloc = []
+rr = [
+  "wasmtime/rr"
+]
+
+[dependencies.wasmtime]
+path = "../crates/wasmtime"
+default-features = false
+features = [
+    "runtime",
+    "component-model",
+    "gc",
+    "pulley"
+]
+
+
+[profile.release]
+panic = "abort"

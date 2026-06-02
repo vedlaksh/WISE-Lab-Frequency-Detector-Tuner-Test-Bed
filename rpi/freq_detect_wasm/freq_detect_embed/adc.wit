@@ -1,0 +1,15 @@
+package local:demo;
+
+
+world host {
+    import rpi: interface {
+        host-alsa-capture-init: func() -> s32;
+        host-read-sample: func() -> s32;
+        host-snd-pcm-close: func();
+        host-printf: func(msg: string);
+        host-sin: func(x: f64) -> f64;
+        host-cos: func(x: f64) -> f64;
+    }
+
+    export run: func() -> s32;
+}
