@@ -9,6 +9,9 @@ world host {
         host-printf: func(msg: string);
         host-sin: func(x: f64) -> f64;
         host-cos: func(x: f64) -> f64;
+        // returns 1 to keep recording/running, 0 to stop (set by Ctrl-C on the host).
+        // Its return value is recorded, so replay stops at the identical iteration.
+        host-should-continue: func() -> s32;
     }
 
     export run: func() -> s32;

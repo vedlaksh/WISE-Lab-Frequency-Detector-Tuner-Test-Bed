@@ -1,25 +1,7 @@
-// #![feature(alloc_error_handler)]
-// #![no_std]
-// #![no_main]
-
-extern crate alloc;
-
 use wasmtime::*;
-use wasmtime::Error as WasmtimeError;
-use std::fs;
+use wasmtime::component::{Component, Linker};
 use std::error::Error;
-use wasmtime::component::{bindgen, Component, Linker};
-use core::panic::PanicInfo;
-use core::alloc::Layout;
-use core::ptr::{self, NonNull};
-use core::option::Option::Some;
-// use core::any::Any;
-// use core::ffi::c_void;
-// use core::fmt::{self, Write};
-use alloc::string::String;
-use std::io::{self, Write};
-
-bindgen!("host" in "/home/jerryfen/zephyrproject/rpi/freq_detect_wasm/freq_detect_embed/adc.wit");
+use std::sync::atomic::{AtomicBool, Ordering};
 
 extern "C" {
     fn host_alsa_capture_init() -> i32;
@@ -30,47 +12,14 @@ extern "C" {
     fn host_cos(x: f64) -> f64;
 }
 
+// Cleared by SIGINT (Ctrl-C). The guest polls host-should-continue() once per
+// analysis block; because that return value is recorded by the RR engine,
+// replay stops at the exact same iteration, so the trace stays replay-clean.
+static KEEP_RUNNING: AtomicBool = AtomicBool::new(true);
 
-// pub struct BufWriter; 
-
-// impl BufWriter {
-//     pub fn new() -> Self {
-//         Self
-//     }
-// }
-
-// impl RecordWriter for BufWriter
-// {
-//     fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
-//         // unsafe { host_rr_write(data.as_ptr(), data.len()) };
-//         // Ok(data.len())
-//         // unsafe { send_bytes(data.as_ptr(), data.len()) };
-//         // Ok(data.len())
-//         Ok(0)
-//     }
-//     fn flush(&mut self) -> Result<(), Error> { Ok(()) }
-// }
-
-pub struct BufWriter;
-
-impl BufWriter {
-    pub fn new() -> Self {
-        Self
-    }
+extern "C" fn handle_sigint(_sig: core::ffi::c_int) {
+    KEEP_RUNNING.store(false, Ordering::SeqCst);
 }
-
-
-impl Write for BufWriter {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        // consume or store the data
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 
 #[no_mangle]
 pub extern "C" fn wasmtime_tls_get() -> *mut core::ffi::c_void {
@@ -81,40 +30,14 @@ pub extern "C" fn wasmtime_tls_get() -> *mut core::ffi::c_void {
 #[no_mangle]
 pub extern "C" fn wasmtime_tls_set(_ptr: *mut core::ffi::c_void) {}
 
-// #[alloc_error_handler]
-// fn oom(layout: Layout) -> ! {
-//     println!("alloc failed: size={} align={}", layout.size(), layout.align());
-//     // panic!();
-//     loop {}
-// }
-
-// #[panic_handler]
-// fn panic(info: &core::panic::PanicInfo) -> ! {
-//     println!("PANIC");
-//     if let Some(loc) = info.location() {
-//         println!("file: {}", loc.file());
-//         println!("line: {}", loc.line());
-//     } else {
-//         println!("(no loc)");
-//     }
-
-//     // if let Some(loc) = info.location() {
-//     //     uart_write_bytes(loc.file().as_bytes());
-//     //     uart_putc(b':');
-//     //     uart_put_dec_u32(loc.line());
-//     // } else {
-//     //     uart_puts(b"(no loc)");
-//     // }
-
-//     loop {}
-// }
-
-
 fn main() -> Result<(), Box<dyn Error>> {
+    // First Ctrl-C asks the guest to stop cleanly (so the trace can be finalized).
+    // signals_based_traps(false) means wasmtime isn't using signal handlers, so
+    // SIGINT is ours.
+    unsafe { libc::signal(libc::SIGINT, handle_sigint as usize); }
+
     let mut config = Config::new();
-    // for use with rr
     config.gc_support(false);
-    // config.target("pulley32").unwrap();
     config.memory_init_cow(false);
     config.signals_based_traps(false);
     config.wasm_component_model(true);
@@ -122,49 +45,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     config.memory_reservation(0);
     config.memory_reservation_for_growth(0);
     config.memory_guard_size(0);
-    // config.debug_info(true);
-    // config.relaxed_simd_deterministic(false);
     config.rr(RRConfig::Recording);
-    // config.rr(RRConfig::None);
 
-    let mut rs = RecordSettings::default();
-
+    let rs = RecordSettings::default();
     let engine = Engine::new(&config)?;
 
-    // let wasm = fs::read("/home/jerryfen/zephyrproject/rpi/freq_detect_wasm/freq_detect_embed/wasm_component/tuner.component.wasm")?;
-
-    // let wasm = fs::read("tuner.component.wasm")?;
-    static WASM_COMPONENT: &[u8] = include_bytes!("/home/jerryfen/zephyrproject/rpi/freq_detect_wasm/freq_detect_embed/wasm_component/tuner.component.wasm");
-
-    // let wasm = WASM_COMPONENT;
+    // The compiled component is embedded at build time (path is relative to this
+    // source file). Regenerate it (clang -> wasm-tools) before rebuilding.
+    static WASM_COMPONENT: &[u8] =
+        include_bytes!("../../../../freq_detect_embed/wasm_component/tuner.component.wasm");
 
     let mut store = Store::new(&engine, ());
 
-    store.record(BufWriter::new(), rs).unwrap();
+    // Real record sink: stream the trace to a file. std's BufWriter<File>
+    // satisfies the blanket RecordWriter impl (Write + Send + Sync + Any).
+    // Override the path with RPI_TRACE if desired.
+    let trace_path = std::env::var("RPI_TRACE").unwrap_or_else(|_| "tuner.trace".to_string());
+    let trace_file = std::fs::File::create(&trace_path)?;
+    let trace_writer = std::io::BufWriter::new(trace_file);
+    store.record(trace_writer, rs).unwrap();
 
-    // engine::new on the raw wasm file, not the cwasm
-    // let module = Module::new(&engine, wasm)?;
     let component = Component::from_binary(&engine, WASM_COMPONENT)?;
 
     let mut linker = Linker::new(&engine);
-
     let mut rpi = linker.instance("rpi").unwrap();
 
     rpi.func_wrap("host-alsa-capture-init", |_caller, (): ()| {
-        // Note: No 'Caller' here to grab memory. 
-        // Data is passed as arguments directly.
-        // println!("host-i2s-configure");
         let retval = unsafe { host_alsa_capture_init() };
-        Ok((retval,)) // Must return a Result for the Linker
+        Ok((retval,))
     }).unwrap();
 
     rpi.func_wrap("host-read-sample", |_caller, (): ()| {
         let retval = unsafe { host_read_sample() };
-        Ok((retval,)) // Must return a Result for the Linker
+        Ok((retval,))
     }).unwrap();
 
     rpi.func_wrap("host-snd-pcm-close", |_caller, (): ()| {
-        // println!("host_adc_raw_to_millivolts");
         unsafe { host_snd_pcm_close() };
         Ok(())
     }).unwrap();
@@ -184,6 +100,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok((y,))
     }).unwrap();
 
+    rpi.func_wrap("host-should-continue", |_caller, (): ()| {
+        let go = if KEEP_RUNNING.load(Ordering::Relaxed) { 1i32 } else { 0i32 };
+        Ok((go,))
+    }).unwrap();
+
     println!("Linker Create ok!");
 
     let instance = match linker.instantiate(&mut store, &component) {
@@ -194,29 +115,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    println!("Linker Instantiate ok!");
+    println!("Linker Instantiate ok! Recording to '{}' - press Ctrl-C to stop.", trace_path);
 
-    // let run = instance.get_typed_func::<(), (i32,)>(&mut store, "run").unwrap();
-
-    let run = match instance.get_typed_func::<(), (i32,)>(&mut store, "run"){
-        Ok(inst) => inst,
+    let run = match instance.get_typed_func::<(), (i32,)>(&mut store, "run") {
+        Ok(f) => f,
         Err(e) => {
             println!("Instance Error: {}", e);
             panic!("Instantiation failed");
         }
     };
 
-    println!("run Create ok!");
-
-    // let (result,) = run.call(&mut store, ()).unwrap();
-
     match run.call(&mut store, ()) {
-        Ok(inst) => (inst, ),
+        Ok(_inst) => {}
         Err(e) => {
             println!("Call Error: {}", e);
             panic!("Call failed");
         }
     };
+
+    // Finalize the trace: writes the RREvent::Eof marker and flushes the tail.
+    // Without this the last (<16) events and the terminator never reach disk,
+    // and replay would not see a clean end-of-trace.
+    match store.into_record_writer() {
+        Ok(w) => { drop(w); println!("Recording finalized: {}", trace_path); }
+        Err(e) => println!("Recording finalize error: {}", e),
+    }
 
     Ok(())
 }

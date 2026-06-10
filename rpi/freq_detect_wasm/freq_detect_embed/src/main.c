@@ -1,36 +1,17 @@
-// #include <alsa/asoundlib.h>
-#include "shim.h"
-// #include "../wit_gen/host.h"
-// #include <math.h>
+#include "shim.h"          /* host imports (host_read_sample, host_printf, host_should_continue, ...) */
 #include <stdint.h>
 #include <stdarg.h>
-// #include <stdio.h>
-// #include <stdlib.h>
 
-#include "kiss_fft.h"
+#include "yin.h"           /* FFT-accelerated YIN pitch detection (also pulls in kiss_fft.h) */
 
-#define N 512
-#define SAMPLE_RATE 48000
-#define CHANNELS 2
-#define ACTIVE_CHANNEL 0   // try 1 if your L/R pin selects the other channel
+/* Safety cap on recorded blocks; the primary stop is host_should_continue()
+ * going to 0 when you press Ctrl-C on the host. Because that return value is
+ * recorded, replay stops at the identical iteration. */
+#define MAX_BLOCKS 1000000L
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+static int16_t analysis_buf[YIN_RAW_LEN];
 
-static int16_t analysis_buf[N];
-
-static kiss_fft_cpx fft_in[N];
-static kiss_fft_cpx fft_out[N];
-static float hann_window[N];
-
-static char fft_mem[8192];
-static kiss_fft_cfg fft_cfg;
-
-int32_t pcm_buf[N * CHANNELS];
-
-char print_buf[64];
-
+/* Minimal printf supporting %s, %d, %ld -> forwarded to the host as ptr+len. */
 static void wasm_printf(const char *fmt, ...) {
     static char buf[96];
     int i = 0;
@@ -63,99 +44,38 @@ static void wasm_printf(const char *fmt, ...) {
     host_printf(buf, (unsigned int)i);
 }
 
-static int detect_best_freq_from_i16(const int16_t *samples, int sample_rate)
+/* Pull one analysis block (YIN_RAW_LEN raw 48 kHz samples) from the host,
+ * one sample per host call. Each return value is recorded by record-replay. */
+static void read_audio_block_i16(int16_t *out)
 {
-    if (!samples || sample_rate <= 0 || !fft_cfg) return 0;
-
-    float mean = 0.0f;
-    for (int i = 0; i < N; i++) {
-        mean += (float)samples[i];
-    }
-    mean /= (float)N;
-
-    for (int i = 0; i < N; i++) {
-        fft_in[i].r = ((float)samples[i] - mean) * hann_window[i];
-        fft_in[i].i = 0.0f;
-    }
-
-    kiss_fft(fft_cfg, fft_in, fft_out);
-
-    int min_bin = (int)(20.0f * (float)N / (float)sample_rate);
-    int max_bin = (int)(2000.0f * (float)N / (float)sample_rate);
-
-    if (min_bin < 1) min_bin = 1;
-    if (max_bin > (N / 2) - 2) max_bin = (N / 2) - 2;
-
-    int peak_bin = -1;
-    float peak_mag = 0.0f;
-
-    for (int i = min_bin; i <= max_bin; i++) {
-        float re = fft_out[i].r;
-        float im = fft_out[i].i;
-        float mag = re * re + im * im;
-
-        if (mag > peak_mag) {
-            peak_mag = mag;
-            peak_bin = i;
-        }
-    }
-
-    if (peak_bin < 0) return 0;
-
-    return peak_bin * sample_rate / N;
-}
-
-
-static int read_audio_block_i16(int16_t *out)
-{
-    for (int i = 0; i < N; i++) {
+    for (int i = 0; i < YIN_RAW_LEN; i++) {
         out[i] = (int16_t)host_read_sample();
     }
-
-    return 0;
 }
 
 int run(void)
 {
     if (host_alsa_capture_init() < 0) {
+        wasm_printf("alsa init failed\n");
         return 1;
     }
 
-    size_t fft_len = sizeof(fft_mem);
-    fft_cfg = kiss_fft_alloc(N, 0, fft_mem, &fft_len);
-    if (!fft_cfg) {
-        // printf("fft alloc failed\n");
-        // int len = snprintf(print_buf, sizeof(print_buf), "fft alloc failed\n");
-        // host_log((uint32_t)print_buf, len);
-        wasm_printf("fft alloc failed\n");
+    if (yin_init() != 0) {
+        wasm_printf("yin init failed\n");
         return -1;
     }
 
-    for (int i = 0; i < N; i++) {
-        hann_window[i] =
-            0.5f * (1.0f - (float)host_cos(2.0f * M_PI * (float)i / (float)(N - 1)));
-    }
-
-    while (1) {
-        // read_audio_block_i16(analysis_buf, N);
-
-        // if(read_audio_block_i16(analysis_buf) != 0){
-        //     wasm_printf("Error Reading From Audio\n");
-        // }
+    for (long k = 0; k < MAX_BLOCKS && host_should_continue(); k++) {
         read_audio_block_i16(analysis_buf);
 
-        int freq = detect_best_freq_from_i16(analysis_buf, SAMPLE_RATE);
+        float conf = 0.0f;
+        int freq = yin_detect(analysis_buf, &conf);
+        int conf_pct = (int)(conf * 100.0f + 0.5f);
 
         if (freq > 0) {
-            // printf("freq=%d Hz\n", freq);
-            // int len = snprintf(print_buf, sizeof(print_buf), "freq=%d\n", freq);
-            // rpi_host_log((uint32_t)print_buf, len);
-            wasm_printf("freq=%d Hz\n", freq);
+            wasm_printf("freq=%d Hz (conf=%d%)\n", freq, conf_pct);
         } else {
-            // printf("no signal\n");
-            // int len = snprintf(print_buf, sizeof(print_buf), "no signal\n");
-            // rpi_host_log((uint32_t)print_buf, len);
-            wasm_printf("no signal\n");
+            wasm_printf("no signal (conf=%d%)\n", conf_pct);
         }
     }
 

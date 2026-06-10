@@ -24,3 +24,6 @@ extern double host_sin(double x);
 
 WASM_IMPORT(host-cos)
 extern double host_cos(double x);
+
+WASM_IMPORT(host-should-continue)
+extern int host_should_continue(void);
