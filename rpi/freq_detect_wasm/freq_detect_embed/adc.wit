@@ -4,7 +4,8 @@ package local:demo;
 world host {
     import rpi: interface {
         host-alsa-capture-init: func() -> s32;
-        host-read-sample: func() -> s32;
+        // returns one analysis block of raw 48 kHz mono samples in a single call
+        host-read-block: func(len: u32) -> list<s16>;
         host-snd-pcm-close: func();
         host-printf: func(msg: string);
         host-sin: func(x: f64) -> f64;

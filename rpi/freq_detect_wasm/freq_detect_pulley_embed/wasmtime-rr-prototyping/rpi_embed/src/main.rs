@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 extern "C" {
     fn host_alsa_capture_init() -> i32;
-    fn host_read_sample() -> i32;
+    fn host_read_block(out: *mut i16, len: u32) -> i32;
     fn host_snd_pcm_close();
     fn host_printf(ptr: *const u8, len: usize);
     fn host_sin(x: f64) -> f64;
@@ -24,7 +24,7 @@ extern "C" fn handle_sigint(_sig: core::ffi::c_int) {
 #[no_mangle]
 pub extern "C" fn wasmtime_tls_get() -> *mut core::ffi::c_void {
     static mut DUMMY: [u8; 1024] = [0; 1024];
-    unsafe { DUMMY.as_mut_ptr() as *mut core::ffi::c_void }
+    unsafe { core::ptr::addr_of_mut!(DUMMY) as *mut core::ffi::c_void }
 }
 
 #[no_mangle]
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // First Ctrl-C asks the guest to stop cleanly (so the trace can be finalized).
     // signals_based_traps(false) means wasmtime isn't using signal handlers, so
     // SIGINT is ours.
-    unsafe { libc::signal(libc::SIGINT, handle_sigint as usize); }
+    unsafe { libc::signal(libc::SIGINT, handle_sigint as *const () as usize); }
 
     let mut config = Config::new();
     config.gc_support(false);
@@ -75,9 +75,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok((retval,))
     }).unwrap();
 
-    rpi.func_wrap("host-read-sample", |_caller, (): ()| {
-        let retval = unsafe { host_read_sample() };
-        Ok((retval,))
+    rpi.func_wrap("host-read-block", |_caller, (len,): (u32,)| {
+        let mut buf = vec![0i16; len as usize];
+        let got = unsafe { host_read_block(buf.as_mut_ptr(), len) };
+        buf.truncate(if got < 0 { 0 } else { got as usize });
+        Ok((buf,))
     }).unwrap();
 
     rpi.func_wrap("host-snd-pcm-close", |_caller, (): ()| {

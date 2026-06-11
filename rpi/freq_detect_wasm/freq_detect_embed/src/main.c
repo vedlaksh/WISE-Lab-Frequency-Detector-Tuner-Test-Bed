@@ -1,4 +1,4 @@
-#include "shim.h"          /* host imports (host_read_sample, host_printf, host_should_continue, ...) */
+#include "shim.h"          /* host imports (host_read_block, host_printf, host_should_continue, ...) */
 #include <stdint.h>
 #include <stdarg.h>
 
@@ -9,7 +9,7 @@
  * recorded, replay stops at the identical iteration. */
 #define MAX_BLOCKS 1000000L
 
-static int16_t analysis_buf[YIN_RAW_LEN];
+extern void wasm_heap_reset(void);   /* bump-arena reset, defined in wasm_libc.c */
 
 /* Minimal printf supporting %s, %d, %ld -> forwarded to the host as ptr+len. */
 static void wasm_printf(const char *fmt, ...) {
@@ -44,15 +44,6 @@ static void wasm_printf(const char *fmt, ...) {
     host_printf(buf, (unsigned int)i);
 }
 
-/* Pull one analysis block (YIN_RAW_LEN raw 48 kHz samples) from the host,
- * one sample per host call. Each return value is recorded by record-replay. */
-static void read_audio_block_i16(int16_t *out)
-{
-    for (int i = 0; i < YIN_RAW_LEN; i++) {
-        out[i] = (int16_t)host_read_sample();
-    }
-}
-
 int run(void)
 {
     if (host_alsa_capture_init() < 0) {
@@ -66,10 +57,20 @@ int run(void)
     }
 
     for (long k = 0; k < MAX_BLOCKS && host_should_continue(); k++) {
-        read_audio_block_i16(analysis_buf);
+        /* Pull one analysis block (YIN_RAW_LEN raw 48 kHz samples) in ONE host
+         * call. The host returns a list<s16> which the canonical ABI lowers into
+         * guest memory (recorded faithfully by record-replay). Reset the bump
+         * arena first so each block reuses the same space. */
+        host_list_s16_t blk;
+        wasm_heap_reset();
+        host_read_block(YIN_RAW_LEN, &blk);
+        if (blk.len < (size_t)YIN_RAW_LEN) {
+            wasm_printf("short read\n");
+            continue;
+        }
 
         float conf = 0.0f;
-        int freq = yin_detect(analysis_buf, &conf);
+        int freq = yin_detect(blk.ptr, &conf);
         int conf_pct = (int)(conf * 100.0f + 0.5f);
 
         if (freq > 0) {

@@ -43,30 +43,37 @@ int host_alsa_capture_init(void)
     return 0;
 }
 
-int32_t host_read_sample(void)
+/* Read one whole block of `len` frames in a few bulk snd_pcm_readi calls (rather
+ * than one frame at a time), extract the active channel, and write `len` int16
+ * samples into `out`. This drains ALSA fast enough to avoid overruns. `out` has
+ * room for `len` samples. Must not exceed the staging buffer (8192 == YIN_RAW_LEN). */
+int host_read_block(int16_t *out, uint32_t len)
 {
-    int32_t frame[CHANNELS];
+    static int32_t pcm_block[8192 * CHANNELS];
+    if (len > 8192) len = 8192;
 
-    while (1) {
-        int err = snd_pcm_readi(pcm, frame, 1);  // read 1 frame
+    uint32_t got = 0;
+    while (got < len) {
+        int err = snd_pcm_readi(pcm, &pcm_block[got * CHANNELS], len - got);
 
         if (err == -EPIPE) {
             fprintf(stderr, "overrun\n");
             snd_pcm_prepare(pcm);
             continue;
         }
-
         if (err < 0) {
             fprintf(stderr, "snd_pcm_readi failed: %s\n", snd_strerror(err));
             snd_pcm_prepare(pcm);
             continue;
         }
 
-        if (err == 1) {
-            int32_t s32 = frame[ACTIVE_CHANNEL];
-            return (int16_t)(s32 >> 16);
+        for (int i = 0; i < err; i++) {
+            int32_t s32 = pcm_block[(got + i) * CHANNELS + ACTIVE_CHANNEL];
+            out[got + i] = (int16_t)(s32 >> 16);
         }
+        got += (uint32_t)err;
     }
+    return (int)got;
 }
 
 // int host_read_audio_block_i16(int16_t *out, int n)

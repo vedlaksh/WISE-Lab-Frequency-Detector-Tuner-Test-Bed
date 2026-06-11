@@ -7,11 +7,11 @@
 WASM_IMPORT(host-alsa-capture-init)
 extern int host_alsa_capture_init();
 
-// WASM_IMPORT(host-read-audio-block-i16)
-// extern int host_read_audio_block_i16(uint32_t n);
+/* component-model list<s16> return: {ptr, len} written into guest linear memory */
+typedef struct { int16_t *ptr; size_t len; } host_list_s16_t;
 
-WASM_IMPORT(host-read-sample)
-extern int host_read_sample();
+WASM_IMPORT(host-read-block)
+extern void host_read_block(uint32_t n, host_list_s16_t *ret);
 
 WASM_IMPORT(host-snd-pcm-close)
 extern void host_snd_pcm_close();
