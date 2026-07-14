@@ -50,6 +50,13 @@ int host_alsa_capture_init(void)
 int host_read_block(int16_t *out, uint32_t len)
 {
     static int32_t pcm_block[8192 * CHANNELS];
+    static FILE *cap = NULL;
+    static int cap_init = 0;
+    if (!cap_init) {                 // open the capture sink once, only if CAPTURE_PCM is set
+        cap_init = 1;
+        const char *cap_path = getenv("CAPTURE_PCM");
+        if (cap_path) cap = fopen(cap_path, "wb");
+    }
     if (len > 8192) len = 8192;
 
     uint32_t got = 0;
@@ -72,6 +79,11 @@ int host_read_block(int16_t *out, uint32_t len)
             out[got + i] = (int16_t)(s32 >> 16);
         }
         got += (uint32_t)err;
+    }
+
+    if (cap) {                       // tap: mirror the exact int16 block handed to the guest
+        fwrite(out, sizeof(int16_t), got, cap);
+        fflush(cap);
     }
     return (int)got;
 }

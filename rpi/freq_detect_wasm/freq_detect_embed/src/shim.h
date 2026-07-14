@@ -1,7 +1,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Normally each host_* is a Wasm import from module "rpi". Building with -DRPI_LOCAL
+ * makes them plain symbols instead, so a self-contained build (e.g. the Wizard replay
+ * module) can define them locally and run with no host. */
+#ifdef RPI_LOCAL
+#define WASM_IMPORT(name)
+#else
 #define WASM_IMPORT(name) __attribute__((import_module("rpi"), import_name(#name)))
+#endif
 
 
 WASM_IMPORT(host-alsa-capture-init)

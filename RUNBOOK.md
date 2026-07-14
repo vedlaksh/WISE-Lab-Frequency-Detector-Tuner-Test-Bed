@@ -7,7 +7,7 @@ binaries, deploy, record, replay, live-stream, and measure trace rate + overhead
 
 | Placeholder | Meaning |
 |---|---|
-| `<target-ip>` | the **Mac's LAN IP** — `ipconfig getifaddr en0` on the Mac (try `en1` if blank / on Ethernet). The Pi dials the Mac, which forwards `-p 9000` into the container. Do **not** use the `colima list` VM address — that subnet is host-only and unreachable from the Pi. |
+| `<target-ip>` | the **Mac's LAN IP** — `ipconfig getifaddr en0` on the Mac (try `en1` if blank / on Ethernet). The Pi dials the Mac, which forwards `-p 9000` into the container. |
 | `<pi>` | your Pi SSH login, e.g. `evaluator@crimp-pi0.local` |
 
 Conventions used throughout: port `9000`, FIFO `/tmp/tuner.fifo`, container name `rpibuild-stream`.
@@ -192,7 +192,7 @@ socat -u TCP-LISTEN:9000,reuseaddr OPEN:/tmp/tuner.fifo,wronly
 ```
 ```bash
 # PI shell 1 — bridge dialer (+ live trace-rate meter via pv)
-pv -btra /tmp/tuner.fifo | socat -u - TCP:<target-ip>:9000,retry=30,interval=1
+pv -btra /tmp/tuner.fifo | socat -u - TCP:172.20.10.2:9000,retry=30,interval=1
 ```
 ```bash
 # PI shell 2 — record into the FIFO
@@ -319,7 +319,83 @@ listener). Measured **~5.65%** on a WiFi hotspot (bursty stream → sub-MSS segm
 
 ---
 
-# Part E — Teardown
+# Part E — Profile the DSP under Wizard (Mac, no mic)
+
+A second analysis path, independent of the Wasmtime RR flow above: run the **unmodified** core
+`tuner.wasm` under the **Wizard** engine and emit a Graphviz self-time profile of the DSP call tree.
+Runs **natively on the Mac** (not the container/Pi). Wizard supplies the `rpi.*` imports itself — a
+project-authored Virgil host module (`wizard-engine/src/modules/wizeng/RpiModule.v3`) that replays audio
+from `capture.pcm` on disk — so there is **no mic, no `-DRPI_LOCAL`, no `rpi_stub.c`, no recompiled
+replay module**. `host-read-block` hand-rolls the component-model canonical-ABI lowering (call the
+guest's exported `cabi_realloc`, copy the block into guest memory, write the `{ptr,len}` descriptor).
+
+Prereqs (once). The engine + `capture.pcm` live **outside the repo** (Virgil's build scripts break on
+spaces in the repo path), at `~/wizard-toolchain/{virgil, wizard-engine}`:
+```bash
+# MAC
+brew install llvm lld openjdk graphviz          # graphviz/dot may already be present
+WZ=~/wizard-toolchain                            # Wizard engine home (outside the repo)
+# Build wizeng once, and after any RpiModule.v3 edit (wizeng.jvm is an arch-independent jar):
+export PATH="$WZ/virgil/bin:/opt/homebrew/opt/openjdk/bin:$PATH"
+cd "$WZ/wizard-engine" && ./build.sh wizeng jvm
+```
+
+## E1. Capture the audio on the Pi, move it to the Mac
+
+The recorder mirrors each mic block to a raw little-endian-int16 file when `CAPTURE_PCM` is set (the
+`bridge.c` tap) — one run writes both `tuner.trace` and `capture.pcm`. Needs an `rpi_embed` built from
+the current tree (rebuild/redeploy per A5–A6 if your deployed binary predates the tap):
+```bash
+# PI — Ctrl-C to finalize, same as B1; produces tuner.trace + capture.pcm side by side
+CAPTURE_PCM=~/capture.pcm ./rpi_embed
+```
+```bash
+# MAC — move capture.pcm to where the Wizard host reads it by default (the run cwd, $WZ)
+scp <pi>:~/capture.pcm "$WZ/capture.pcm"
+ls -l "$WZ/capture.pcm"                           # size = N * 16384 B (one 8192-sample block = 16384 B)
+```
+
+## E2. Build the core `tuner.wasm` with its `rpi` imports intact (Mac)
+
+**Not** the container component build (A4): Wizard runs a **core** module, and the committed
+`wasm_component/*.wasm` are stale (old `host-read-sample`, no `cabi_realloc`). Rebuild from this Mac
+checkout's sources — no `-DRPI_LOCAL` (imports survive), `-fno-inline` (keeps `yin_decimate` a distinct
+node), and export `cabi_realloc` (so the host can allocate guest memory):
+```bash
+# MAC
+export PATH="/opt/homebrew/opt/lld/bin:$PATH"
+MREPO="$HOME/path/to/WISE-Lab-Frequency-Detector-Tuner-Test-Bed"   # this Mac checkout (quote it — real path has spaces)
+G="$MREPO/rpi/freq_detect_wasm/freq_detect_embed/src"
+/opt/homebrew/opt/llvm/bin/clang --target=wasm32 -O2 -ffast-math -nostdlib \
+  -fno-inline -fno-inline-functions -I "$G" \
+  -Wl,--no-entry -Wl,--export=run -Wl,--export=cabi_realloc \
+  -Wl,--stack-first -Wl,--initial-memory=8388608 \
+  -o /tmp/tuner_core.wasm "$G/main.c" "$G/kiss_fft.c" "$G/wasm_libc.c"
+strings /tmp/tuner_core.wasm | grep -E 'host-read-block|cabi_realloc'   # both must appear
+```
+
+## E3. Run the profile monitor + render
+```bash
+# MAC — wizeng.jvm needs java; capture.pcm is read from cwd (or pass an absolute path as a trailing arg)
+export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"
+cd "$WZ"                                          # so ./capture.pcm resolves
+wizard-engine/bin/wizeng.jvm --monitors='profile{dot}' --colors=false /tmp/tuner_core.wasm > tuner.profile.dot
+dot -Tsvg tuner.profile.dot -o tuner.profile.svg
+# path-override form (run from any cwd):
+# wizard-engine/bin/wizeng.jvm --monitors='profile{dot}' /tmp/tuner_core.wasm /abs/path/capture.pcm > tuner.profile.dot
+```
+Repo convenience wrapper (override its engine path): `WIZENG="$WZ/wizard-engine/bin/wizeng.jvm"
+"$MREPO/wizard/profile_dot.sh" /tmp/tuner_core.wasm`.
+
+**Success = clean exit, no trap for unresolved `rpi.*`, and `yin_decimate` dominates (~89% self-time)**
+with the FFT `kf_bfly4` butterflies ~1–2% each. `host_sin`/`host_cos` run in the Wizard host, so they do
+**not** appear in the graph (that's the intended difference from the old embedded build). A missing/empty
+`capture.pcm` → `host-should-continue` returns 0 → zero iterations → a degenerate but trap-free profile,
+which is itself proof the audio is read at runtime.
+
+---
+
+# Part F — Teardown
 ```bash
 # PI:  Ctrl-C / pkill any leftover socat, rpi_embed, pv
 # MAC:
@@ -342,5 +418,9 @@ colima stop                      # frees the VM's RAM/CPU
 | Replay errors mid-stream, no clean end | Recorder died without writing `Eof`. Re-run; only a clean Ctrl-C finalizes the trace. |
 | Trace-rate run gives a wild number | The recorder exited before the timer (`kill: No such process`). Use the `timeout` form in D1, and check the mic isn't held by a stray `rpi_embed`. |
 | `measure` shows tiny `blocks` | Mic busy (stray `rpi_embed` on `hw:0,0`) → ALSA init failed fast. `pkill -f rpi_embed` and redo. |
+| Wizard: `Unable to locate a Java Runtime` | `wizeng.jvm` needs `java`. `export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"` (Part E). |
+| Wizard: unresolved `rpi.*` import / trap at load | You ran a stale `wasm_component/*.wasm` (old `host-read-sample`, no `cabi_realloc`). Rebuild the core module from `src/` (E2). |
+| Wizard: "no entrypoint" or a degenerate/empty profile | `capture.pcm` not found in cwd (run from `$WZ` or pass an absolute path as a trailing arg), or the module was built without `-Wl,--export=cabi_realloc` / `-Wl,--export=run`. |
+| `clang: … wasm-ld … not found` | `wasm-ld` ships in the separate `lld` formula. `brew install lld && export PATH="/opt/homebrew/opt/lld/bin:$PATH"`. |
 
 *Why no code change is needed for streaming: record path via `RPI_TRACE` (`rpi_embed/src/main.rs:63-64`), read path via `--trace` (`src/commands/replay.rs:107`) — both are plain sequential stream I/O, and a FIFO is a valid path for each.*
